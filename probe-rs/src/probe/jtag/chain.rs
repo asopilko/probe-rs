@@ -159,7 +159,7 @@ impl<'p> JtagChain<'p> {
 
         tracing::debug!("DR: {:?}", response.as_bits());
 
-        let idcodes = extract_idcodes(response.as_bits())?;
+        let mut idcodes = extract_idcodes(response.as_bits())?;
 
         tracing::info!(
             "JTAG DR scan complete, found {} TAPs. {:?}",
@@ -215,6 +215,9 @@ impl<'p> JtagChain<'p> {
 
         tracing::info!("Found {} TAPs on reset scan", idcodes.len());
         tracing::debug!("Detected IR lens: {:?}", ir_lens);
+
+        // A trailing TAP with an all-ones IDCODE is only found by the IR scan.
+        idcodes.resize(ir_lens.len(), None);
 
         let state = self.probe.chain_state();
         state.scan_chain = idcodes

@@ -365,8 +365,11 @@ impl CmsisDap {
         ir_lengths: Option<&[usize]>,
     ) -> Result<Vec<ScanChainElement>, CmsisDapError> {
         let (ir, dr) = self.jtag_reset_scan()?;
-        let idcodes = extract_idcodes(&dr)?;
+        let mut idcodes = extract_idcodes(&dr)?;
         let ir_lens = extract_ir_lengths(&ir, idcodes.len(), ir_lengths)?;
+
+        // A trailing TAP with an all-ones IDCODE is only found by the IR scan.
+        idcodes.resize(ir_lens.len(), None);
 
         Ok(idcodes
             .into_iter()
