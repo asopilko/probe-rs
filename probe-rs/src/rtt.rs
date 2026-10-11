@@ -146,6 +146,9 @@ pub struct Rtt {
     /// The location of the control block in target memory.
     ptr: u64,
 
+    /// The size of the control block, with its channel descriptors.
+    size: usize,
+
     /// The detected up (target to host) channels.
     pub up_channels: Vec<UpChannel>,
 
@@ -380,6 +383,7 @@ impl Rtt {
 
         Ok(Rtt {
             ptr,
+            size: rtt_header.total_rtt_buffer_size(),
             up_channels,
             down_channels,
         })
@@ -511,6 +515,11 @@ impl Rtt {
     /// Returns the memory address of the control block in target memory.
     pub fn ptr(&self) -> u64 {
         self.ptr
+    }
+
+    /// Returns the size of the control block, with its channel descriptors.
+    pub fn size(&self) -> usize {
+        self.size
     }
 
     /// Returns a reference to the detected up channels.

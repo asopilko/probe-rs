@@ -31,7 +31,7 @@ impl core::fmt::Debug for MemoryAccessPort<'_> {
 
 impl<'probe> MemoryAccessPort<'probe> {
     /// Create a new [`MemoryAccessPort`].
-    pub(crate) fn new_for_core(core: crate::Core<'probe>) -> MemoryAccessPort<'probe> {
+    pub fn new_for_core(core: crate::Core<'probe>) -> MemoryAccessPort<'probe> {
         let id = core.id();
         let name = core.name().to_string();
         Self {

@@ -1,0 +1,1 @@
+RTT is accessed through a memory port of the target when one reaches the RTT memory, so polling does not halt the core. That memory must not be cached by the core, or RTT data is stale and the firmware can block.
