@@ -403,6 +403,15 @@ impl ChipFamily {
                     }
                 }
 
+                for port in memory.memory_ports() {
+                    if !variant.memory_ports.iter().any(|p| &p.name == port) {
+                        return Err(format!(
+                            "Variant {}, memory region {:?} is assigned to a non-existent memory port {}",
+                            variant.name, memory, port
+                        ));
+                    }
+                }
+
                 if memory.cores().is_empty() {
                     return Err(format!(
                         "Variant {}, memory region {:?} is not assigned to a core",
