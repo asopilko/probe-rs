@@ -21,6 +21,7 @@ use probe_rs_rpc::{FlashLoader, Key};
 use probe_rs_rpc_client::{ClientError, CoreInterface, SessionInterface};
 use tokio::runtime::Handle;
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::num::NonZeroUsize;
@@ -45,7 +46,6 @@ use super::GdbSessionContext;
 /// Actions for resuming a core
 #[derive(Debug, Copy, Clone)]
 pub(crate) enum ResumeAction {
-    Unchanged,
     Resume,
     Step,
 }
@@ -71,7 +71,10 @@ pub(crate) struct RuntimeTarget {
 
     listener: TcpListener,
     gdb: Option<GdbStubStateMachine<'static, RuntimeTarget, TcpStream>>,
-    resume_action: (usize, ResumeAction),
+    /// Actions GDB requested per core for the next resume.
+    resume_actions: HashMap<usize, ResumeAction>,
+    /// Only cores in `resume_actions` may run (`set scheduler-locking on`).
+    scheduler_locked: bool,
 
     target_desc: TargetDescription,
     /// Server-side flash loader created for an in-progress GDB `load`.
@@ -120,7 +123,8 @@ impl RuntimeTarget {
             flash_sectors: context.flash_sectors.clone(),
             listener,
             gdb: None,
-            resume_action: (0, ResumeAction::Unchanged),
+            resume_actions: HashMap::new(),
+            scheduler_locked: false,
             target_desc: TargetDescription::default(),
             flash_loader: None,
             flash_erased: false,
