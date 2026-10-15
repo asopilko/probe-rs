@@ -72,6 +72,8 @@ pub(crate) struct RuntimeTarget {
     listener: TcpListener,
     gdb: Option<GdbStubStateMachine<'static, RuntimeTarget, TcpStream>>,
     resume_action: (usize, ResumeAction),
+    /// Cores started by the last resume; only these can report a stop.
+    running_cores: Vec<usize>,
 
     target_desc: TargetDescription,
     /// Server-side flash loader created for an in-progress GDB `load`.
@@ -121,6 +123,7 @@ impl RuntimeTarget {
             listener,
             gdb: None,
             resume_action: (0, ResumeAction::Unchanged),
+            running_cores: Vec::new(),
             target_desc: TargetDescription::default(),
             flash_loader: None,
             flash_erased: false,
@@ -255,8 +258,12 @@ impl RuntimeTarget {
             let WireCoreStatus::Halted(reason) = status else {
                 continue;
             };
+            let index = index as usize;
+            if !self.running_cores.contains(&index) {
+                continue;
+            }
 
-            let tid = NonZeroUsize::new(index as usize + 1).unwrap();
+            let tid = NonZeroUsize::new(index + 1).unwrap();
             stop_reason = Some(match reason {
                 WireHaltReason::Breakpoint(
                     WireBreakpointCause::Hardware | WireBreakpointCause::Unknown,
