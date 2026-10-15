@@ -1,30 +1,38 @@
 use super::{ResumeAction, RuntimeTarget};
 use probe_rs_rpc::core_ops::WireSteppingMode;
 
-use gdbstub::target::ext::base::multithread::MultiThreadSingleStepOps;
-use gdbstub::target::ext::base::multithread::{MultiThreadResume, MultiThreadSingleStep};
+use gdbstub::target::ext::base::multithread::{
+    MultiThreadResume, MultiThreadSchedulerLocking, MultiThreadSchedulerLockingOps,
+    MultiThreadSingleStep, MultiThreadSingleStepOps,
+};
 
 impl MultiThreadResume for RuntimeTarget {
     fn resume(&mut self) -> Result<(), Self::Error> {
-        match self.resume_action {
-            (_, ResumeAction::Resume) => {
-                let cores = self.cores.iter().map(|core| core.index as u32).collect();
-                self.block_on(self.session.resume_cores(Some(cores)))?;
+        let mut resume = Vec::new();
+        for core in &self.cores {
+            match self.resume_actions.get(&core.index) {
+                Some(ResumeAction::Step) => {
+                    self.block_on(
+                        self.session
+                            .debug_step(core.index as u32, WireSteppingMode::StepInstruction),
+                    )?;
+                }
+                Some(ResumeAction::Resume) => resume.push(core.index as u32),
+                None if !self.scheduler_locked => resume.push(core.index as u32),
+                None => {}
             }
-            (core_id, ResumeAction::Step) => {
-                self.block_on(
-                    self.session
-                        .debug_step(core_id as u32, WireSteppingMode::StepInstruction),
-                )?;
-            }
-            (_, ResumeAction::Unchanged) => {}
+        }
+
+        if !resume.is_empty() {
+            self.block_on(self.session.resume_cores(Some(resume)))?;
         }
 
         Ok(())
     }
 
     fn clear_resume_actions(&mut self) -> Result<(), Self::Error> {
-        self.resume_action = (0, ResumeAction::Resume);
+        self.resume_actions.clear();
+        self.scheduler_locked = false;
         Ok(())
     }
 
@@ -34,11 +42,15 @@ impl MultiThreadResume for RuntimeTarget {
         _signal: Option<gdbstub::common::Signal>,
     ) -> Result<(), Self::Error> {
         let core_id = tid.get() - 1;
-        self.resume_action = (core_id, ResumeAction::Resume);
+        self.resume_actions.insert(core_id, ResumeAction::Resume);
         Ok(())
     }
 
     fn support_single_step(&mut self) -> Option<MultiThreadSingleStepOps<'_, Self>> {
+        Some(self)
+    }
+
+    fn support_scheduler_locking(&mut self) -> Option<MultiThreadSchedulerLockingOps<'_, Self>> {
         Some(self)
     }
 }
@@ -50,7 +62,14 @@ impl MultiThreadSingleStep for RuntimeTarget {
         _signal: Option<gdbstub::common::Signal>,
     ) -> Result<(), Self::Error> {
         let core_id = tid.get() - 1;
-        self.resume_action = (core_id, ResumeAction::Step);
+        self.resume_actions.insert(core_id, ResumeAction::Step);
+        Ok(())
+    }
+}
+
+impl MultiThreadSchedulerLocking for RuntimeTarget {
+    fn set_resume_action_scheduler_lock(&mut self) -> Result<(), Self::Error> {
+        self.scheduler_locked = true;
         Ok(())
     }
 }
