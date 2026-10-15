@@ -173,18 +173,36 @@ impl GdbSessionContext {
     ) -> anyhow::Result<Self> {
         let metadata = session.target_metadata().await?;
         let target = registry.get_target_by_name(&metadata.target_name).ok();
+        let enabled_cores: Vec<u32> = session
+            .cores_status(None)
+            .await?
+            .statuses
+            .into_iter()
+            .map(|(index, _)| index)
+            .collect();
 
         let mut cores = Vec::with_capacity(metadata.cores.len());
         for wire_core in &metadata.cores {
             let core_type = from_wire_core_type(wire_core.core_type);
-            let meta = session.core(wire_core.index as usize).metadata().await?;
-            let registers = CoreRegisters::for_core_type(
-                core_type,
-                meta.fpu_support,
-                meta.floating_point_register_count
-                    .map(|count| count as usize),
-            );
-            let instruction_set = from_wire_instruction_set(meta.instruction_set);
+            let (registers, instruction_set) =
+                if core_type.is_cortex_m() && !enabled_cores.contains(&wire_core.index) {
+                    // A disabled core can't be queried, but every Cortex-M uses Thumb-2.
+                    (
+                        CoreRegisters::for_core_type(core_type, false, None),
+                        InstructionSet::Thumb2,
+                    )
+                } else {
+                    let meta = session.core(wire_core.index as usize).metadata().await?;
+                    (
+                        CoreRegisters::for_core_type(
+                            core_type,
+                            meta.fpu_support,
+                            meta.floating_point_register_count
+                                .map(|count| count as usize),
+                        ),
+                        from_wire_instruction_set(meta.instruction_set),
+                    )
+                };
 
             let name = target
                 .as_ref()
