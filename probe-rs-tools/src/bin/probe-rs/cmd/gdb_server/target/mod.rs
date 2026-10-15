@@ -261,7 +261,11 @@ impl RuntimeTarget {
                 WireHaltReason::Breakpoint(
                     WireBreakpointCause::Hardware | WireBreakpointCause::Unknown,
                 ) => MultiThreadStopReason::HwBreak(tid),
-                WireHaltReason::Step => MultiThreadStopReason::DoneStep,
+                // `DoneStep` carries no thread id, so GDB would switch to the first thread.
+                WireHaltReason::Step => MultiThreadStopReason::SignalWithThread {
+                    tid,
+                    signal: Signal::SIGTRAP,
+                },
                 _ => MultiThreadStopReason::SignalWithThread {
                     tid,
                     signal: Signal::SIGINT,
