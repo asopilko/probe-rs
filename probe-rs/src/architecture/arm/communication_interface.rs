@@ -1091,6 +1091,9 @@ impl ArmCommunicationInterface {
             }
         }
 
+        // The JTAG sticky-error check reads address 0x4 directly, which must be CTRL/STAT.
+        dp_state.current_select.set_dp_bank_sel(0);
+
         if !was_valid || previous_select != dp_state.current_select {
             tracing::debug!("Changing SELECT to {:x?}", dp_state.current_select);
 
@@ -1099,8 +1102,9 @@ impl ArmCommunicationInterface {
                     self.write_dp_register(ap.dp(), select)?;
                 }
                 SelectCache::DPv3(select, select1) => {
-                    self.write_dp_register(ap.dp(), select)?;
+                    // Writing SELECT1 switches DP_BANK_SEL; write SELECT last to restore bank 0.
                     self.write_dp_register(ap.dp(), select1)?;
+                    self.write_dp_register(ap.dp(), select)?;
                 }
             }
         }
