@@ -483,6 +483,7 @@ mod tests {
             cores: vec!["main".into()],
             memory_ports: vec![],
             is_alias: false,
+            alias_of: None,
         };
 
         (region, flash_algorithm)
@@ -516,6 +517,7 @@ mod tests {
             cores: vec!["main".into()],
             memory_ports: vec![],
             is_alias: false,
+            alias_of: None,
         };
 
         (region, flash_algorithm)

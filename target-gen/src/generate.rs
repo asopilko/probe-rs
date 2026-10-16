@@ -608,6 +608,7 @@ pub(crate) fn get_mem_map(device: &Device, cores: &[probe_rs_target::Core]) -> V
                         cores,
                         memory_ports: vec![],
                         is_alias: false,
+                        alias_of: None,
                     }));
                 }
             },

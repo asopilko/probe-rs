@@ -113,6 +113,7 @@ impl Target {
                         boot: false,
                     }),
                     memory_ports: vec![],
+                    alias_of: None,
                 }));
             }
 

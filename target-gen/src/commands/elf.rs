@@ -125,6 +125,7 @@ pub fn cmd_elf(
                         cores: vec!["main".to_owned()],
                         name: None,
                         is_alias: false,
+                        alias_of: None,
                     }),
                     MemoryRegion::Ram(RamRegion {
                         range: 0x1_0000..0x2_0000,
@@ -403,6 +404,7 @@ mod test {
             name: Some(String::from("Flash")),
             access: None,
             is_alias: false,
+            alias_of: None,
         }));
 
         let family = ChipFamily {

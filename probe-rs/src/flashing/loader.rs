@@ -773,6 +773,19 @@ impl FlashLoader {
             data.len()
         );
 
+        let address = match Self::get_region_for_address(&self.memory_map, address) {
+            Some(MemoryRegion::Nvm(region)) if region.alias_of.is_some() => {
+                let redirected = region.resolve_alias(address);
+                tracing::debug!(
+                    "Redirecting flash data from alias address {:#010x} to canonical {:#010x}",
+                    address,
+                    redirected
+                );
+                redirected
+            }
+            _ => address,
+        };
+
         self.check_data_in_memory_map(address..address + data.len() as u64)?;
         self.builder.add_data(address, data)
     }

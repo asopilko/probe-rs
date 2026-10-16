@@ -65,9 +65,9 @@ pub(crate) enum DebugSessionStatus {
 enum RequestFailure {
     /// The request failed. The client receives an error response, and the
     /// session continues.
-    Request(DebuggerError),
+    Request(Box<DebuggerError>),
     /// The session cannot continue.
-    Session(DebuggerError),
+    Session(Box<DebuggerError>),
 }
 
 impl RequestFailure {
@@ -80,13 +80,13 @@ impl RequestFailure {
 
 impl From<DebuggerError> for RequestFailure {
     fn from(error: DebuggerError) -> Self {
-        Self::Request(error)
+        Self::Request(Box::new(error))
     }
 }
 
 impl From<anyhow::Error> for RequestFailure {
     fn from(error: anyhow::Error) -> Self {
-        Self::Request(DebuggerError::Other(error))
+        Self::Request(Box::new(DebuggerError::Other(error)))
     }
 }
 
@@ -200,7 +200,7 @@ impl Debugger {
             RequestFailure::Request(_) => {
                 Ok(DebugSessionStatus::Continue(Duration::from_millis(50)))
             }
-            RequestFailure::Session(error) => Err(error),
+            RequestFailure::Session(error) => Err(*error),
         }
     }
 
@@ -217,14 +217,14 @@ impl Debugger {
         session_data
             .poll_cores(&self.config, debug_adapter)
             .await
-            .map_err(RequestFailure::Session)?;
+            .map_err(|error| RequestFailure::Session(Box::new(error)))?;
 
         // Check if we have configured cores
         if session_data.core_data.is_empty() {
             if debug_adapter.configuration_is_done() {
                 // We've passed `configuration_done` and still do not have at least one core configured.
-                return Err(RequestFailure::Session(DebuggerError::Other(anyhow!(
-                    "Cannot continue unless one target core configuration is defined."
+                return Err(RequestFailure::Session(Box::new(DebuggerError::Other(
+                    anyhow!("Cannot continue unless one target core configuration is defined."),
                 ))));
             }
 
@@ -237,8 +237,8 @@ impl Debugger {
         let core_id = 0;
 
         let Some(target_core_config) = self.config.core_configs.get(core_id) else {
-            return Err(RequestFailure::Session(DebuggerError::Other(anyhow!(
-                "No core configuration found for core id {core_id}"
+            return Err(RequestFailure::Session(Box::new(DebuggerError::Other(
+                anyhow!("No core configuration found for core id {core_id}"),
             ))));
         };
         let core_index = target_core_config.core_index;
