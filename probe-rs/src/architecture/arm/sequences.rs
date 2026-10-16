@@ -31,7 +31,7 @@ use super::{
     core::cortex_m::{Dhcsr, Vtor},
     dp::{Abort, DPIDR, DpAccess, DpAddress, SelectV1},
     memory::{
-        ArmMemoryInterface,
+        ArmMemoryInterface, MemoryAccessSecurityPolicy,
         romtable::{CoresightComponent, PeripheralType},
     },
     traits::DebugPortWire,
@@ -455,6 +455,14 @@ pub(crate) fn cortex_m_wait_for_reset(
 ///
 /// Should be implemented on a custom handle for chips that require special sequence code.
 pub trait ArmDebugSequence: Send + Sync + Debug {
+    /// The policy that sets `CSW.HNONSEC` per address for memory accesses through `ap`.
+    fn memory_security_policy(
+        &self,
+        _ap: &FullyQualifiedApAddress,
+    ) -> Option<MemoryAccessSecurityPolicy> {
+        None
+    }
+
     /// Assert a system-wide reset line nRST. This is based on the
     /// `ResetHardwareAssert` function from the [ARM SVD Debug Description].
     ///

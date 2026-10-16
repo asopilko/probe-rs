@@ -6,7 +6,7 @@ use crate::{
             AccessPortType, ApAccess, ApRegister, CSW, DRW, DataSize, TAR, TAR2,
             memory_ap::{DataSizeSetup, MemoryAp, MemoryApType},
         },
-        memory::ArmMemoryInterface,
+        memory::{ArmMemoryInterface, MemoryAccessSecurityPolicy},
     },
     memory::{Operation, OperationKind},
     probe::DebugProbeError,
@@ -29,6 +29,7 @@ pub(crate) struct ADIMemoryInterface<'interface, APA: DapAccess> {
     epoch: u64,
     /// Whether `memory_ap` is known to match the hardware.
     trusted: bool,
+    security_policy: Option<MemoryAccessSecurityPolicy>,
 }
 
 impl<'interface, APA> ADIMemoryInterface<'interface, APA>
@@ -39,6 +40,7 @@ where
     pub fn new(
         interface: &'interface mut APA,
         access_port_address: &FullyQualifiedApAddress,
+        security_policy: Option<MemoryAccessSecurityPolicy>,
     ) -> Result<ADIMemoryInterface<'interface, APA>, ArmError> {
         let memory_ap = match interface.take_memory_ap(access_port_address) {
             Some(memory_ap) => memory_ap,
@@ -49,7 +51,34 @@ where
             interface,
             memory_ap,
             trusted: true,
+            security_policy,
         })
+    }
+
+    fn apply_security_policy(&mut self, address: u64) -> Result<(), ArmError> {
+        if let Some(policy) = self.security_policy
+            && let Err(error) = self.memory_ap.set_hnonsec(self.interface, policy(address))
+        {
+            self.trusted &= self.memory_ap.status(self.interface).is_ok();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn security_policy_chunk_size(
+        &self,
+        address: u64,
+        max_elements: usize,
+        element_size: u64,
+    ) -> usize {
+        let Some(policy) = self.security_policy else {
+            return max_elements;
+        };
+
+        let security = policy(address);
+        (1..max_elements)
+            .find(|index| policy(address + *index as u64 * element_size) != security)
+            .unwrap_or(max_elements)
     }
 }
 
@@ -545,6 +574,10 @@ where
         &mut self,
         operations: &mut [Operation<'_>],
     ) -> Result<(), (usize, ArmError)> {
+        if self.security_policy.is_some() {
+            return self.run_operations_one_by_one(operations);
+        }
+
         let mut start = 0;
 
         while start < operations.len() {
@@ -599,6 +632,56 @@ where
         Ok(())
     }
 
+    /// Run each operation on its own, so a batch never mixes secure and non-secure accesses.
+    fn run_operations_one_by_one(
+        &mut self,
+        operations: &mut [Operation<'_>],
+    ) -> Result<(), (usize, ArmError)> {
+        for (index, operation) in operations.iter_mut().enumerate() {
+            let address = operation.address;
+            let result = match &mut operation.operation {
+                OperationKind::Read(data) => self.read(address, data),
+                OperationKind::Read8(data) => self.read_8(address, data),
+                OperationKind::Read16(data) => self.read_16(address, data),
+                OperationKind::Read32(data) => self.read_32(address, data),
+                OperationKind::Read64(data) => self.read_64(address, data),
+                OperationKind::Write(data) => self.write_bytes_by_width(address, data),
+                OperationKind::Write8(data) => self.write_8(address, data),
+                OperationKind::Write16(data) => self.write_16(address, data),
+                OperationKind::Write32(data) => self.write_32(address, data),
+                OperationKind::Write64(data) => self.write_64(address, data),
+                OperationKind::WriteWord8(value) => self.write_8(address, &[*value]),
+                OperationKind::WriteWord16(value) => self.write_16(address, &[*value]),
+                OperationKind::WriteWord32(value) => self.write_32(address, &[*value]),
+                OperationKind::WriteWord64(value) => self.write_64(address, &[*value]),
+            };
+            result.map_err(|error| (index, error))?;
+            operation.result = Some(Ok(()));
+        }
+        Ok(())
+    }
+
+    /// Write bytes as an unaligned head, a run of words and an unaligned tail, each on its own.
+    fn write_bytes_by_width(&mut self, address: u64, data: &[u8]) -> Result<(), ArmError> {
+        let boundary = (address.next_multiple_of(4) - address) as usize;
+        let (head, rest) = data.split_at(boundary.min(data.len()));
+        let (words, tail) = rest.as_chunks::<4>();
+
+        if !(head.is_empty() && tail.is_empty()) && self.memory_ap.supports_only_32bit_data_size() {
+            return Err(ArmError::alignment_error(address, 4));
+        }
+
+        if !head.is_empty() {
+            self.write_8(address, head)?;
+        }
+        let words: Vec<u32> = words.iter().map(|word| u32::from_le_bytes(*word)).collect();
+        self.write_32(address + head.len() as u64, &words)?;
+        if !tail.is_empty() {
+            self.write_8(address + (head.len() + words.len() * 4) as u64, tail)?;
+        }
+        Ok(())
+    }
+
     /// Write `shape`, taking each DRW word from `word`.
     fn run_write(
         &mut self,
@@ -608,9 +691,47 @@ where
         self.run_shape(shape, word, &mut [])
     }
 
+    /// Perform `shape`, one batch per run of addresses the security policy treats alike.
+    fn run_shape(
+        &mut self,
+        shape: &Shape,
+        mut word: impl FnMut(usize, usize) -> Option<u32>,
+        words: &mut [u32],
+    ) -> Result<(), ArmError> {
+        if self.security_policy.is_none() {
+            return self.run_batch_shape(shape, word, words);
+        }
+
+        let drw_words = shape.width.drw_words();
+        let mut done = 0;
+        while done < shape.elements {
+            let address = shape.element_address(done);
+            let count = self.security_policy_chunk_size(
+                address,
+                shape.elements - done,
+                shape.width.bytes(),
+            );
+            self.apply_security_policy(address)?;
+
+            let segment = Shape::new(address, shape.width, count);
+            let segment_words = if words.is_empty() {
+                &mut [][..]
+            } else {
+                &mut words[done * drw_words..(done + count) * drw_words]
+            };
+            self.run_batch_shape(
+                &segment,
+                |element, index| word(done + element, index),
+                segment_words,
+            )?;
+            done += count;
+        }
+        Ok(())
+    }
+
     /// Perform `shape` in one batch. The CSW write for its transfer size goes in the same batch,
     /// unless the AP has to be set up separately.
-    fn run_shape(
+    fn run_batch_shape(
         &mut self,
         shape: &Shape,
         word: impl FnMut(usize, usize) -> Option<u32>,
@@ -900,7 +1021,7 @@ mod tests {
         fn new_mock(
             mock: &'interface mut MockMemoryAp,
         ) -> ADIMemoryInterface<'interface, MockMemoryAp> {
-            Self::new(mock, &FullyQualifiedApAddress::v1_with_default_dp(0)).unwrap()
+            Self::new(mock, &FullyQualifiedApAddress::v1_with_default_dp(0), None).unwrap()
         }
 
         fn mock_memory(&self) -> &[u8] {

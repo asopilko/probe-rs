@@ -3,6 +3,9 @@
 mod adi_memory_interface;
 pub mod romtable;
 
+/// Returns `true` if an access to the address must be non-secure (`CSW.HNONSEC = 1`).
+pub type MemoryAccessSecurityPolicy = fn(u64) -> bool;
+
 pub(crate) use adi_memory_interface::ADIMemoryInterface;
 
 use crate::{CoreStatus, memory::MemoryInterface, probe::DebugProbeError};
