@@ -201,6 +201,10 @@ impl RunLoop {
                     if let Some(reason) = return_reason {
                         return reason;
                     }
+                    // After cancellation the event receiver may already be gone, so a send error is expected.
+                    if self.cancellation_token.is_cancelled() {
+                        return Ok(ReturnReason::Cancelled);
+                    }
                     next_poll = next_poll.min(poller_result?);
                 }
 
