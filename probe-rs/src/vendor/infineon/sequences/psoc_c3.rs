@@ -20,18 +20,20 @@ use probe_rs_target::Chip;
 use crate::{
     Permissions,
     architecture::arm::{
-        ArmDebugInterface, ArmError, FullyQualifiedApAddress,
+        ArmDebugInterface, ArmError, DapAccess, FullyQualifiedApAddress,
         dp::DpAddress,
         memory::ArmMemoryInterface,
-        sequences::{ArmDebugSequence, DebugEraseSequence},
+        sequences::{ArmDebugSequence, DebugEraseSequence, DefaultArmSequence},
+        traits::DebugPortWire,
     },
 };
 
+use super::common;
 use super::{psoc_c3_common, psoc_c3_erase::DualBankErase};
 
 /// Post-reset settle time — the boot ROM needs this long to re-open the AP after a
-/// soft reset. This family settles faster than x7/x8, which uses 400ms instead.
-const RESET_DELAY_MS: u64 = 350;
+/// soft reset. PSC3M5 needs the same margin as x7/x8.
+const RESET_DELAY_MS: u64 = common::RESET_FINISH_DELAY_MS;
 
 /// Generic PSOC C3 debug sequence for devices without a custom debug-cert
 /// unlock flow (M3/M5/P2/P5).
@@ -51,6 +53,38 @@ impl PsocC3 {
 }
 
 impl ArmDebugSequence for PsocC3 {
+    /// The boot ROM must be running to wake the dormant SWJ-DP, so nRESET can't be held.
+    fn reset_hardware_assert(&self, _interface: &mut dyn DebugPortWire) -> Result<(), ArmError> {
+        tracing::warn!(
+            "PSOC C3: `--connect-under-reset` is not supported; skipping nRESET assertion"
+        );
+        Ok(())
+    }
+
+    fn reset_hardware_deassert(
+        &self,
+        _interface: &mut dyn ArmDebugInterface,
+        _default_ap: &FullyQualifiedApAddress,
+    ) -> Result<(), ArmError> {
+        Ok(())
+    }
+
+    fn debug_port_setup(
+        &self,
+        interface: &mut dyn DebugPortWire,
+        dp: DpAddress,
+    ) -> Result<(), ArmError> {
+        psoc_c3_common::debug_port_setup(interface, dp)
+    }
+
+    fn debug_port_start(
+        &self,
+        interface: &mut dyn DapAccess,
+        dp: DpAddress,
+    ) -> Result<(), ArmError> {
+        common::dp_start_with_powerup(interface, dp, true, true)
+    }
+
     /// Corrects `CSW.HNONSEC` based on `CSW.SDeviceEn` on the default AP.
     ///
     /// Without this, AP register writes (e.g. `DRW`, used to write `DHCSR` when
@@ -102,5 +136,31 @@ impl ArmDebugSequence for PsocC3 {
         // SRSS soft reset clears the CM33 AP CSW — re-apply HNONSEC/access fields
         // so the very next AP register access doesn't fail.
         psoc_c3_common::apply_standard_cm33_csw(arm, &cm33_ap)
+    }
+
+    /// Sticky errors left by a reset or sleeping firmware would fault the stock DHCSR writes.
+    fn debug_core_stop(
+        &self,
+        interface: &mut dyn ArmMemoryInterface,
+        core_type: probe_rs_target::CoreType,
+    ) -> Result<(), ArmError> {
+        let dp = interface.fully_qualified_address().dp();
+        if let Ok(arm) = interface.get_arm_debug_interface()
+            && let Err(e) = common::clear_dp_sticky_errors(arm, dp)
+        {
+            tracing::warn!("PSOC C3: failed to clear DP sticky errors before core stop: {e:?}");
+        }
+
+        self.debug_core_stop_default(interface, core_type)
+    }
+
+    fn debug_port_stop(
+        &self,
+        interface: &mut dyn DebugPortWire,
+        dp: DpAddress,
+    ) -> Result<(), ArmError> {
+        let result = DefaultArmSequence(()).debug_port_stop(interface, dp);
+        common::enter_dormant(interface);
+        result
     }
 }
