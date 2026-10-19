@@ -13,24 +13,136 @@ use bitfield::bitfield;
 use crate::{
     MemoryMappedRegister,
     architecture::arm::{
-        ApV2Address, ArmDebugInterface, ArmError, FullyQualifiedApAddress,
+        ApV2Address, ArmDebugInterface, ArmError, DapAccess, FullyQualifiedApAddress,
         core::armv7m::Dhcsr,
-        dp::{Abort, DpAddress, DpRegister},
+        dp::{Ctrl, DpAddress, DpRegister},
         memory::ArmMemoryInterface,
-        sequences::cortex_m_wait_for_reset,
+        sequences::ArmDebugSequence,
+        traits::DebugPortWire,
     },
+    probe::WireProtocol,
+    vendor::DefaultArmSequence,
 };
 
-/// AP CSW register offset (ADIv6 APv2 layout).
-pub(super) const AP_CSW: u64 = 0xD00;
-/// AP TAR register offset (ADIv6 APv2 layout).
-pub(super) const AP_TAR: u64 = 0xD04;
-/// AP DRW register offset (ADIv6 APv2 layout).
-pub(super) const AP_DRW: u64 = 0xD0C;
+use super::common;
+pub(super) use super::common::AP_CSW;
+use super::common::{
+    SYS_AP_BASE, cortex_m_wait_for_reset_with_recovery, jtag_dp_powerup, try_jtag_dormant_wake,
+};
 
-/// SYS AP base address (`__apid=0`) — Infineon's proprietary bus-access AP, used to
-/// reach `SRSS` registers regardless of the CM33 AP's lock state.
-pub(super) const SYS_AP_BASE: u64 = 0xF000_0000;
+const XRES_HOLD_MS: u64 = 100;
+
+/// Spans the whole boot: the boot ROM enables the SWJ pins only part-way through it.
+const DORMANT_WAKE_TIMEOUT_MS: u64 = 1300;
+const RESET_DELAY_MS: u64 = 400;
+const POST_RESET_SETTLE_MS: u64 = 10;
+
+/// The SWD-to-JTAG switch and the dormant alert both put an awake JTAG DP back to dormant.
+pub(super) fn debug_port_setup_dormant_jtag(
+    interface: &mut dyn DebugPortWire,
+    dp: DpAddress,
+) -> Result<(), ArmError> {
+    if interface.active_protocol() != Some(WireProtocol::Jtag) {
+        return common::swd_dormant_connect_or_default(interface, dp, None);
+    }
+
+    let tap_is_visible = common::jtag_tap_visible(interface);
+
+    tracing::debug!("PSOC C3: initial JTAG TAP visible={tap_is_visible}");
+
+    if tap_is_visible {
+        if let Some(mut chain) = interface.try_jtag_chain()
+            && let Err(error) = chain.select(0)
+        {
+            return Err(ArmError::Other(format!(
+                "PSOC C3: selecting JTAG TAP 0 failed: {error}"
+            )));
+        }
+        return Ok(());
+    }
+
+    // `debug_port_stop` leaves the DP dormant; try a wake before resetting with XRES.
+    tracing::debug!("PSOC C3: initial JTAG TAP missing; trying dormant wake without XRES");
+    if common::try_jtag_dormant_wake(
+        interface,
+        Some(Duration::from_millis(DORMANT_WAKE_TIMEOUT_MS)),
+    )? {
+        return DefaultArmSequence(()).debug_port_connect(interface, dp);
+    }
+
+    // XRES restarts the boot ROM, which re-enables the SWJ pins.
+    tracing::warn!("PSOC C3: cannot attach without a reset; resetting the target via XRES");
+    pulse_xres(interface);
+    let result = common::jtag_dormant_wake_or_default(
+        interface,
+        dp,
+        Some(Duration::from_millis(DORMANT_WAKE_TIMEOUT_MS)),
+    );
+    tracing::debug!(
+        "PSOC C3: JTAG dormant recovery result={:?}",
+        result.as_ref().err()
+    );
+    result
+}
+
+pub(super) fn debug_port_setup(
+    interface: &mut dyn DebugPortWire,
+    dp: DpAddress,
+) -> Result<(), ArmError> {
+    if interface.active_protocol() == Some(WireProtocol::Jtag) {
+        tracing::debug!("PSOC C3: JTAG — dormant-to-JTAG wake with XRES reset-acquire");
+        return self::debug_port_setup_dormant_jtag(interface, dp);
+    }
+
+    // Phase 1: try to connect without resetting (400 ms = `__Reset_Finish_Delay`).
+    // Handles fresh power-on, post-soft-reset reconnect, and stale SWD sessions.
+    tracing::debug!("PSOC C3: Phase 1 — non-destructive dormant connect (400 ms)");
+    if common::try_swd_dormant_connect(interface, Duration::from_millis(RESET_DELAY_MS))? {
+        tracing::debug!("PSOC C3: Phase 1 connected");
+        return DefaultArmSequence(()).debug_port_connect(interface, dp);
+    }
+    // Phase 2: BootROM window has closed (user code running). Pulse XRES to
+    // restart BootROM and re-open the window, then retry for 1.2 s.
+    tracing::warn!("PSOC C3: cannot attach without a reset; resetting the target via XRES");
+    match interface.target_reset() {
+        Ok(()) => tracing::debug!("PSOC C3: Phase 2 — XRES pulsed"),
+        Err(e) => tracing::warn!("PSOC C3: Phase 2 — XRES unavailable: {e}"),
+    }
+    thread::sleep(Duration::from_millis(10));
+
+    tracing::debug!("PSOC C3: Phase 2 — dormant connect loop (1.2 s)");
+    if common::try_swd_dormant_connect(interface, Duration::from_millis(1200))? {
+        tracing::debug!("PSOC C3: Phase 2 connected");
+        return DefaultArmSequence(()).debug_port_connect(interface, dp);
+    }
+
+    tracing::warn!("PSOC C3: all connection attempts failed");
+    DefaultArmSequence(()).debug_port_connect(interface, dp)
+}
+
+pub(super) fn debug_port_start(
+    interface: &mut dyn DapAccess,
+    dp: DpAddress,
+) -> Result<(), ArmError> {
+    common::dp_start_with_powerup(interface, dp, true, true)
+}
+
+pub(super) fn debug_port_stop(
+    interface: &mut dyn DebugPortWire,
+    dp: DpAddress,
+) -> Result<(), ArmError> {
+    let result = DefaultArmSequence(()).debug_port_stop(interface, dp);
+    common::enter_dormant(interface);
+    result
+}
+
+fn pulse_xres(interface: &mut dyn DebugPortWire) {
+    if common::pulse_xres_for(interface, XRES_HOLD_MS) {
+        tracing::debug!("PSOC C3: XRES pulsed");
+    } else {
+        tracing::warn!("PSOC C3: probe cannot control nRESET; XRES pulse skipped");
+    }
+}
 
 bitfield! {
     /// SYS AP CSW register — Infineon proprietary bus-access AP.
@@ -123,42 +235,7 @@ pub(super) fn sys_ap(dp: DpAddress) -> FullyQualifiedApAddress {
     FullyQualifiedApAddress::v2_with_dp(dp, ApV2Address(Some(SYS_AP_BASE)))
 }
 
-/// Write one 32-bit word to `addr` through the given AP using raw TAR/DRW register
-/// writes.
-///
-/// `memory_interface()` cannot be used for the SYS AP: that function initialises a
-/// standard AMBA memory-AP adapter and resets CSW to a generic default, which clears
-/// the SYS AP's `DbgSwEnable` bit and makes subsequent transfers fail. The SYS AP is
-/// Infineon's proprietary bus-access portal, not a standard AHB/AXI AP.
-pub(super) fn write_mem32(
-    iface: &mut dyn ArmDebugInterface,
-    ap: &FullyQualifiedApAddress,
-    addr: u32,
-    val: u32,
-) -> Result<(), ArmError> {
-    iface.write_raw_ap_register(ap, AP_TAR, addr)?;
-    iface.write_raw_ap_register(ap, AP_DRW, val)?;
-    Ok(())
-}
-
-/// Read one 32-bit word from `addr` through the given AP using raw TAR/DRW register
-/// accesses.
-///
-/// See [`write_mem32`] for why `memory_interface()` cannot be used for the SYS AP.
-pub(super) fn read_mem32(
-    iface: &mut dyn ArmDebugInterface,
-    ap: &FullyQualifiedApAddress,
-    addr: u32,
-) -> Result<u32, ArmError> {
-    iface.write_raw_ap_register(ap, AP_TAR, addr)?;
-    iface.read_raw_ap_register(ap, AP_DRW)
-}
-
 /// `FLASHC_FLASH_CTL` register — flash controller configuration (CM33 AP view).
-///
-/// Read to determine the flash bank mode. This mirrors Infineon's OpenOCD
-/// `cat1b` flow, which reads the same register over the CM33 AP to decide whether
-/// to expose a single main bank or split it into `main0`/`main1` dual banks.
 pub(super) const FLASHC_FLASH_CTL: u64 = 0x5215_0000;
 /// `FLASHC_FLASH_CTL.BANK` (bit 12) — set when the flash is in dual-bank mode.
 pub(super) const FLASHC_FLASH_CTL_BANK: u32 = 0x0000_1000;
@@ -199,7 +276,7 @@ pub(super) fn detect_flash_bank_mode(
         FlashBankMode::Single
     };
 
-    tracing::info!(
+    tracing::debug!(
         "PSOC C3: FLASHC_FLASH_CTL={:#010x} → {:?} flash bank mode",
         ctl,
         mode
@@ -275,23 +352,71 @@ pub(super) fn apply_standard_cm33_csw(
     Ok(())
 }
 
-/// Clear the DP sticky-error flags latched by the soft reset.
-///
-/// The SRSS soft-reset write faults its own transaction — the AHB fabric drops the access as
-/// the SoC resets — which latches `STICKYERR`/`WDATAERR`/… . While those are set every
-/// subsequent AP access faults with "communication with an access port or debug port", so
-/// they have to be cleared before the AP is touched again. Best-effort: if the DP write
-/// itself cannot get through there is nothing better to do than report it.
-pub(super) fn clear_dp_sticky_errors(interface: &mut dyn ArmDebugInterface, dp: DpAddress) {
-    let mut abort = Abort(0);
-    abort.set_orunerrclr(true);
-    abort.set_wderrclr(true);
-    abort.set_stkerrclr(true);
-    abort.set_stkcmpclr(true);
-
-    if let Err(e) = interface.write_raw_dp_register(dp, Abort::ADDRESS, abort.0) {
-        tracing::warn!("PSOC C3: failed to clear the DP sticky errors after reset: {e:?}");
+/// Over JTAG the soft reset drops the TAP until the boot ROM re-enables the SWJ pins.
+pub(super) fn reestablish_jtag_after_reset(interface: &mut dyn ArmMemoryInterface, dp: DpAddress) {
+    let Ok(arm) = interface.get_arm_debug_interface() else {
+        return;
+    };
+    if ArmDebugInterface::active_wire_protocol(arm) != Some(WireProtocol::Jtag) {
+        return;
     }
+
+    let _ = arm.debug_port_reconnect_with(&mut |probe| {
+        // The dormant alert can disturb an already-awake TAP.
+        if !common::jtag_tap_visible(probe) {
+            let woken =
+                try_jtag_dormant_wake(probe, Some(Duration::from_millis(DORMANT_WAKE_TIMEOUT_MS)))
+                    .unwrap_or(false);
+            if !woken {
+                tracing::warn!("PSOC C3: JTAG TAP did not reappear after reset");
+            }
+        } else if let Some(mut chain) = probe.try_jtag_chain()
+            && let Err(error) = chain.select(0)
+        {
+            tracing::warn!("PSOC C3: selecting JTAG TAP 0 after reset failed: {error}");
+        }
+        Ok(())
+    });
+
+    jtag_dp_powerup(arm, dp, true);
+}
+
+/// Lets the posted JTAG pipeline settle after the reset before core access resumes.
+fn synchronize_jtag_after_reset(interface: &mut dyn ArmMemoryInterface, dp: DpAddress) {
+    let Ok(arm) = interface.get_arm_debug_interface() else {
+        return;
+    };
+    if ArmDebugInterface::active_wire_protocol(arm) != Some(WireProtocol::Jtag) {
+        return;
+    }
+
+    let ctrl = arm.read_raw_dp_register(dp, Ctrl::ADDRESS);
+    let cm33_ap = common::cm33(dp);
+    let ap_idr = arm.read_raw_ap_register(&cm33_ap, 0xDFC);
+    tracing::debug!(
+        "PSOC C3: post-reset JTAG synchronization: CTRL/STAT={ctrl:?}, CM33 AP IDR={ap_idr:?}"
+    );
+    let _ = arm.flush();
+    thread::sleep(Duration::from_millis(POST_RESET_SETTLE_MS));
+}
+
+pub(super) fn reconnect_after_reset(
+    interface: &mut dyn ArmMemoryInterface,
+    dp: DpAddress,
+) -> Result<(), ArmError> {
+    let arm = interface.get_arm_debug_interface()?;
+    reconnect_debug_port(arm, dp)
+}
+
+pub(super) fn reconnect_debug_port(
+    arm: &mut dyn ArmDebugInterface,
+    dp: DpAddress,
+) -> Result<(), ArmError> {
+    arm.debug_port_reconnect_with(&mut |probe| {
+        debug_port_setup_dormant_jtag(probe, dp)?;
+        DefaultArmSequence(()).debug_port_connect(probe, dp)
+    })?;
+    common::dp_start_with_powerup(arm, dp, true, true)
 }
 
 /// Halt the CM33 and trigger an SRSS soft reset through the SYS AP, then wait for
@@ -323,7 +448,7 @@ pub(super) fn halt_and_soft_reset(
         let arm = interface.get_arm_debug_interface()?;
         arm.write_raw_ap_register(&sys_ap, AP_CSW, SysApCsw::secure_word().0)?;
         // Write triggers an immediate soft reset; transaction error is expected.
-        let _ = write_mem32(arm, &sys_ap, SRSS_RES_SOFT_CTL, SRSS_RES_SOFT_CTL_TRIG_SOFT);
+        let _ = common::write_mem32(arm, &sys_ap, SRSS_RES_SOFT_CTL, SRSS_RES_SOFT_CTL_TRIG_SOFT);
         // Flush the batch so the DRW write reaches the chip before we sleep —
         // otherwise the write can be deferred until the first post-reset read,
         // which then races the reset itself.
@@ -336,7 +461,12 @@ pub(super) fn halt_and_soft_reset(
     );
     thread::sleep(delay);
 
-    cortex_m_wait_for_reset(interface)?;
+    reestablish_jtag_after_reset(interface, dp);
+    synchronize_jtag_after_reset(interface, dp);
+
+    cortex_m_wait_for_reset_with_recovery(interface, |interface| {
+        reconnect_after_reset(interface, dp)
+    })?;
 
     Ok(())
 }
