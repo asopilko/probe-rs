@@ -53,6 +53,8 @@ impl Vendor for Infineon {
             || chip.name.starts_with("PSC3P8")
         {
             DebugSequence::Arm(PsocC3X7X8::create(chip))
+        } else if chip.name.starts_with("PSC3M6") || chip.name.starts_with("PSC3P6") {
+            DebugSequence::Arm(PsocC3::create_x6(chip))
         } else {
             return None;
         };

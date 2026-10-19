@@ -1,4 +1,4 @@
-//! Debug sequences for PSOC C3 (M3/M5/P2/P5) devices.
+//! Debug sequences for PSOC C3 (M3/M5/P2/P5) and PSOC C3 x6 (M6/P6) devices.
 //!
 //! These devices' CM33 access port is a TrustZone-aware AHB5 AP whose `CSW.HNONSEC`
 //! bit must be derived from `CSW.SDeviceEn` (secure debug enabled). The generic AHB5
@@ -36,9 +36,11 @@ use super::{psoc_c3_common, psoc_c3_erase::DualBankErase};
 const RESET_DELAY_MS: u64 = common::RESET_FINISH_DELAY_MS;
 
 /// Generic PSOC C3 debug sequence for devices without a custom debug-cert
-/// unlock flow (M3/M5/P2/P5).
+/// unlock flow (M3/M5/P2/P5 and M6/P6).
 #[derive(Debug)]
 pub struct PsocC3 {
+    /// x6 latches the DP sticky-error flags on the soft-reset transaction fault.
+    clear_sticky_errors_after_reset: bool,
     /// How this part has to be erased, decided once the device reports its bank layout.
     erase: DualBankErase,
 }
@@ -47,6 +49,15 @@ impl PsocC3 {
     /// Creates the debug sequence for a generic PSOC C3 chip (M3/M5/P2/P5).
     pub fn create(chip: &Chip) -> Arc<Self> {
         Arc::new(PsocC3 {
+            clear_sticky_errors_after_reset: false,
+            erase: DualBankErase::new(chip),
+        })
+    }
+
+    /// Creates the debug sequence for a PSOC C3 x6 chip (M6/P6).
+    pub fn create_x6(chip: &Chip) -> Arc<Self> {
+        Arc::new(PsocC3 {
+            clear_sticky_errors_after_reset: true,
             erase: DualBankErase::new(chip),
         })
     }
@@ -132,6 +143,10 @@ impl ArmDebugSequence for PsocC3 {
 
         let cm33_ap = interface.fully_qualified_address();
         let arm = interface.get_arm_debug_interface()?;
+
+        if self.clear_sticky_errors_after_reset {
+            let _ = common::clear_dp_sticky_errors(arm, cm33_ap.dp());
+        }
 
         // SRSS soft reset clears the CM33 AP CSW — re-apply HNONSEC/access fields
         // so the very next AP register access doesn't fail.
