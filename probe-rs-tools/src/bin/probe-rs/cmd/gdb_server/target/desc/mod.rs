@@ -37,16 +37,16 @@ impl TargetDescriptionXmlOverride for RuntimeTarget {
 
 impl RuntimeTarget {
     pub(crate) fn load_target_desc(&mut self) -> Result<(), anyhow::Error> {
-        let primary = self
-            .cores
-            .first()
-            .ok_or_else(|| anyhow!("GDB stub has no cores"))?;
+        // Disabled cores can't be queried, so use the first core whose metadata can be read.
+        let (core_type, primary) = (0..self.cores.len())
+            .find_map(|position| {
+                let metadata = self.core_metadata(position).ok()?;
+                Some((self.cores[position].core_type, metadata))
+            })
+            .ok_or_else(|| anyhow!("None of the GDB stub's cores is enabled"))?;
 
-        self.target_desc = build_target_description(
-            primary.registers,
-            primary.core_type,
-            primary.instruction_set,
-        );
+        self.target_desc =
+            build_target_description(primary.registers, core_type, primary.instruction_set);
         Ok(())
     }
 
@@ -56,9 +56,11 @@ impl RuntimeTarget {
             .first()
             .ok_or_else(|| anyhow!("GDB stub has no cores"))?;
 
-        let address_size = primary
-            .registers
-            .pc()
+        let address_size = self
+            .cores
+            .iter()
+            .find_map(|core| core.metadata)
+            .and_then(|metadata| metadata.registers.pc())
             .map(|reg| reg.size_in_bits())
             .unwrap_or(32);
 

@@ -16,12 +16,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use probe_rs::CoreRegisters;
-use probe_rs::InstructionSet;
 use probe_rs::config::Registry;
+use probe_rs::{CoreRegisters, CoreType, InstructionSet};
 use probe_rs_rpc::chip::MemoryRegion;
 use probe_rs_rpc::info::WireFlashSector;
-use probe_rs_rpc_client::{RpcClient, SessionInterface};
+use probe_rs_rpc_client::{ClientError, CoreInterface, RpcClient, SessionInterface};
 use tokio::runtime::Handle;
 
 use crate::rpc::functions::core_ops::convert::{from_wire_core_type, from_wire_instruction_set};
@@ -162,8 +161,30 @@ pub(crate) struct GdbCoreInfo {
     pub index: usize,
     pub name: String,
     pub core_type: probe_rs::CoreType,
+    /// `None` while the core is disabled, as a disabled core can't be queried.
+    pub metadata: Option<CoreMetadata>,
+}
+
+/// Register and instruction set of a core, read from the core itself.
+#[derive(Clone, Copy)]
+pub(crate) struct CoreMetadata {
     pub registers: &'static CoreRegisters,
     pub instruction_set: InstructionSet,
+}
+
+impl CoreMetadata {
+    pub async fn fetch(core: &CoreInterface, core_type: CoreType) -> Result<Self, ClientError> {
+        let meta = core.metadata().await?;
+        Ok(Self {
+            registers: CoreRegisters::for_core_type(
+                core_type,
+                meta.fpu_support,
+                meta.floating_point_register_count
+                    .map(|count| count as usize),
+            ),
+            instruction_set: from_wire_instruction_set(meta.instruction_set),
+        })
+    }
 }
 
 impl GdbSessionContext {
@@ -184,25 +205,13 @@ impl GdbSessionContext {
         let mut cores = Vec::with_capacity(metadata.cores.len());
         for wire_core in &metadata.cores {
             let core_type = from_wire_core_type(wire_core.core_type);
-            let (registers, instruction_set) =
-                if core_type.is_cortex_m() && !enabled_cores.contains(&wire_core.index) {
-                    // A disabled core can't be queried, but every Cortex-M uses Thumb-2.
-                    (
-                        CoreRegisters::for_core_type(core_type, false, None),
-                        InstructionSet::Thumb2,
-                    )
-                } else {
-                    let meta = session.core(wire_core.index as usize).metadata().await?;
-                    (
-                        CoreRegisters::for_core_type(
-                            core_type,
-                            meta.fpu_support,
-                            meta.floating_point_register_count
-                                .map(|count| count as usize),
-                        ),
-                        from_wire_instruction_set(meta.instruction_set),
-                    )
-                };
+            // The metadata of a disabled core is fetched later, once the core is enabled.
+            let core_metadata = if enabled_cores.contains(&wire_core.index) {
+                let core = session.core(wire_core.index as usize);
+                Some(CoreMetadata::fetch(&core, core_type).await?)
+            } else {
+                None
+            };
 
             let name = target
                 .as_ref()
@@ -214,8 +223,7 @@ impl GdbSessionContext {
                 index: wire_core.index as usize,
                 name,
                 core_type,
-                registers,
-                instruction_set,
+                metadata: core_metadata,
             });
         }
 
