@@ -639,8 +639,8 @@ impl JLink {
 
     /// Selects the interface to use for talking to the target MCU.
     ///
-    /// Switching interfaces will reset the configured transfer speed, so [`JLink::set_speed`]
-    /// needs to be called *after* `select_interface`.
+    /// Switching interfaces resets the transfer speed on the probe, so a speed previously
+    /// configured with [`JLink::set_speed`] is re-applied after the switch.
     ///
     /// This requires the probe to support [`Capability::SelectIf`].
     ///
