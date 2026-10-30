@@ -221,19 +221,18 @@ impl ArmDebugSequence for PsocEdge {
 
             // If the CM55 has already been enabled, do NOT re-run the full power-up /
             // CPU_WAIT-release sequence on every attach. `session.core(1)` calls this
-            // on each access (connect, `info threads`, register reads), and re-driving
-            // that sequence re-writes DHCSR and can resume a core the debugger had
-            // already halted, which then makes register reads fail. Instead just
-            // confirm the debug interface is still live and (re-)halt the core.
+            // on each access (connect, `info threads`, register reads, status polls of a
+            // running core), so only confirm the debug interface is still live and leave
+            // the core's run state alone.
             if self.cm55_enabled.load(Ordering::Relaxed) {
-                match self.ensure_cm55_halted(interface) {
+                match self.check_cm55_debug_enabled(interface) {
                     Ok(()) => {
                         // Skip the default `on_attach`: on a halted CM55 it can poison the shared JTAG DP.
                         return Ok(());
                     }
                     Err(e) => {
                         // Interface no longer responding — fall back to a full re-enable.
-                        tracing::debug!("CM55 re-attach halt check failed: {:?}", e);
+                        tracing::debug!("CM55 re-attach debug check failed: {:?}", e);
                         common::recover_dp(interface, dp);
                         self.cm55_enabled.store(false, Ordering::Relaxed);
                     }
@@ -1113,15 +1112,24 @@ impl PsocEdge {
         Ok(())
     }
 
-    /// Lightweight re-attach path for an already-enabled CM55.
-    ///
-    /// Instead of re-running the full power-up / CPU_WAIT-release sequence (which
-    /// re-writes DHCSR and can resume a core the debugger had already halted), this
-    /// just confirms the CM55 debug interface is still responding and (re-)halts the
-    /// core for the debugger.
+    /// Returns `CoreDisabled` if the CM55's halting debug is no longer enabled.
+    fn check_cm55_debug_enabled(
+        &self,
+        interface: &mut dyn ArmDebugInterface,
+    ) -> Result<(), ArmError> {
+        let mut cm55_ap = interface.memory_interface(&self.cm55_ap)?;
+        let dhcsr = Dhcsr(cm55_ap.read_word_32(Dhcsr::get_mmio_address())?);
+        if dhcsr.c_debugen() {
+            Ok(())
+        } else {
+            Err(ArmError::CoreDisabled)
+        }
+    }
+
+    /// Halts the CM55 for the debugger when it is first enabled.
     ///
     /// Returns `Err(ArmError::CoreDisabled)` if the CM55 debug interface is no longer
-    /// accessible, so the caller can fall back to a full re-enable.
+    /// accessible.
     fn ensure_cm55_halted(&self, interface: &mut dyn ArmDebugInterface) -> Result<(), ArmError> {
         let mut cm55_ap = interface.memory_interface(&self.cm55_ap)?;
 
